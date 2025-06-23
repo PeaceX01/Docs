@@ -1,0 +1,1154 @@
+using Microsoft.AspNetCore.Mvc;
+using HospitalManagementSystem.Models;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http; // For Session extensions
+using Microsoft.EntityFrameworkCore;
+using HospitalManagementSystem.Data;
+using System.Diagnostics; // For Debug.WriteLine
+using System; // For DateTime, TimeSpan
+using System.Collections.Generic; // For List
+using System.Globalization; // For CultureInfo.InvariantCulture
+
+namespace HospitalManagementSystem.Controllers
+{
+    public class AppointmentController : Controller
+    {
+        private readonly HospitalDbContext _context;
+
+        public AppointmentController(HospitalDbContext context)
+        {
+            _context = context;
+        }
+
+        // Helper methods for session-based role/ID checks
+        private bool IsLoggedIn() => !string.IsNullOrEmpty(HttpContext.Session.GetString("Username"));
+        private bool IsDoctor() => HttpContext.Session.GetString("Role") == "Doctor";
+        private bool IsAdmin() => HttpContext.Session.GetString("Role") == "Admin";
+        private bool IsPatient() => HttpContext.Session.GetString("Role") == "Patient";
+
+        private int? GetPatientIdFromSession() => HttpContext.Session.GetInt32("PatientId");
+        private int? GetDoctorIdFromSession() => HttpContext.Session.GetInt32("DoctorId");
+
+
+        // GET: Appointment/AllAppointments (Admin and Doctor View)
+        [HttpGet]
+        public async Task<IActionResult> AllAppointments(string searchString)
+        {
+            if (!IsLoggedIn() || (!IsAdmin() && !IsDoctor()))
+            {
+                TempData["ErrorMessage"] = "You are not authorized to view all appointments.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            IQueryable<Appointment> appointments = _context.Appointments
+                                                            .Include(a => a.Patient)
+                                                            .Include(a => a.Doctor);
+
+            if (IsDoctor())
+            {
+                int? doctorId = GetDoctorIdFromSession();
+                if (!doctorId.HasValue || doctorId.Value == 0)
+                {
+                    TempData["ErrorMessage"] = "Doctor ID not found in session. Please log in again.";
+                    return RedirectToAction("Login", "Account");
+                }
+                appointments = appointments.Where(a => a.DoctorId == doctorId.Value);
+                ViewData["Title"] = "My Appointments"; // Doctor's own appointments
+            }
+            else // IsAdmin()
+            {
+                ViewData["Title"] = "All Hospital Appointments"; // Admin sees all
+            }
+
+            // Apply search filter
+            if (!string.IsNullOrEmpty(searchString))
+            {
+                appointments = appointments.Where(a =>
+                    (a.Patient != null && a.Patient.Name != null && a.Patient.Name.Contains(searchString)) ||
+                    (a.Doctor != null && a.Doctor.Name != null && a.Doctor.Name.Contains(searchString)) ||
+                    (a.Reason != null && a.Reason.Contains(searchString)) ||
+                    (a.Status != null && a.Status.Contains(searchString)));
+            }
+            ViewData["CurrentFilter"] = searchString; // Preserve search string in view
+
+            return View(await appointments.OrderByDescending(a => a.AppointmentDateTime).ToListAsync());
+        }
+
+        // GET: Appointment/Appointments (Patient's Own Appointments)
+        [HttpGet]
+        public async Task<IActionResult> Appointments()
+        {
+            if (!IsLoggedIn() || !IsPatient())
+            {
+                TempData["ErrorMessage"] = "You must be logged in as a Patient to view your appointments.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            int? patientId = GetPatientIdFromSession();
+            if (!patientId.HasValue || patientId.Value == 0)
+            {
+                TempData["ErrorMessage"] = "Patient ID not found in session. Please log in again.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            var patientAppointments = await _context.Appointments
+                                                    .Include(a => a.Doctor)
+                                                    .Include(a => a.Patient)
+                                                    .Where(a => a.PatientId == patientId.Value)
+                                                    .OrderByDescending(a => a.AppointmentDateTime)
+                                                    .ToListAsync();
+
+            ViewData["Title"] = "My Appointments";
+            return View(patientAppointments);
+        }
+
+        // GET: Appointment/Create (Allows pre-filling of patient/doctor IDs)
+        [HttpGet]
+        public async Task<IActionResult> Create(int? patientId, int? doctorId)
+        {
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to book an appointment.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            if (IsPatient())
+            {
+                patientId = GetPatientIdFromSession();
+            }
+
+            ViewBag.Patients = await _context.Patients
+                                             .OrderBy(p => p.Name)
+                                             .Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" })
+                                             .ToListAsync();
+            ViewBag.Doctors = await _context.Doctors
+                                            .OrderBy(d => d.Name)
+                                            .Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" })
+                                            .ToListAsync();
+
+            var model = new Appointment
+            {
+                PatientId = patientId ?? 0,
+                DoctorId = doctorId ?? 0,
+                AppointmentDateTime = DateTime.Now.AddHours(1).Date.AddHours(9), // Suggests a default future date/time
+                Status = "Scheduled",
+                Price = 0.00m // Initialize price for the form
+            };
+
+            ViewData["Title"] = "Book New Appointment";
+            return View(model);
+        }
+
+        // POST: Appointment/Create
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> Create([Bind("PatientId,DoctorId,AppointmentDateTime,Reason,Location,Status,Price")] Appointment appointment)
+        {
+            // Debugging the incoming appointment price
+            Debug.WriteLine($"Attempting to create appointment with Price: {appointment.Price}");
+
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to book an appointment.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            if (IsPatient())
+            {
+                int? sessionPatientId = GetPatientIdFromSession();
+                if (!sessionPatientId.HasValue || sessionPatientId.Value == 0 || sessionPatientId.Value != appointment.PatientId)
+                {
+                    TempData["ErrorMessage"] = "You are not authorized to book appointments for other patients or your session is invalid.";
+                    return RedirectToAction("Login", "Account");
+                }
+            }
+            else if (IsDoctor())
+            {
+                int? sessionDoctorId = GetDoctorIdFromSession();
+                if (!sessionDoctorId.HasValue || sessionDoctorId.Value == 0)
+                {
+                    TempData["ErrorMessage"] = "Your doctor session is invalid. Please log in again.";
+                    return RedirectToAction("Login", "Account");
+                }
+            }
+            else if (!IsAdmin())
+            {
+                TempData["ErrorMessage"] = "Unauthorized access to appointment booking.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            // Manually add price validation if not handled by default model binding attributes
+            if (appointment.Price < 0)
+            {
+                ModelState.AddModelError("Price", "Price cannot be negative.");
+            }
+            // For now, let's set a default price if it's 0 or not set, as per user's request for automatic billing.
+            // In a real app, this should come from user input or a price lookup.
+            if (appointment.Price == 0.00m)
+            {
+                // This is a placeholder. You should replace this with actual pricing logic
+                // e.g., fetching a price based on doctor, service, or pre-defined rates.
+                appointment.Price = 100.00m; // Example: Set a default price of 100.00
+                Debug.WriteLine($"Appointment price was 0 or not set, defaulting to: {appointment.Price}");
+            }
+
+
+            if (ModelState.IsValid)
+            {
+                if (string.IsNullOrEmpty(appointment.Status))
+                {
+                    appointment.Status = "Scheduled";
+                }
+
+                if (appointment.AppointmentDateTime < DateTime.Now && appointment.Status == "Scheduled")
+                {
+                    ModelState.AddModelError("AppointmentDateTime", "Appointment date and time cannot be in the past for new appointments.");
+                    ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                    ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                    ViewData["Title"] = "Book New Appointment";
+                    return View(appointment);
+                }
+
+                bool isDoctorBusy = await _context.Appointments.AnyAsync(a =>
+                    a.DoctorId == appointment.DoctorId &&
+                    a.AppointmentDateTime == appointment.AppointmentDateTime &&
+                    a.Status != "Cancelled" && a.Status != "Completed");
+
+                if (isDoctorBusy)
+                {
+                    TempData["ErrorMessage"] = "The selected doctor is not available at this exact time. Please choose another time.";
+                    ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                    ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                    ViewData["Title"] = "Book New Appointment";
+                    return View(appointment);
+                }
+
+                // --- Begin: Automatic Bill Creation Logic ---
+                // Add the appointment first to get its ID, which is needed for the bill
+                _context.Add(appointment);
+                await _context.SaveChangesAsync(); // Save appointment to get its ID
+
+                Debug.WriteLine($"Appointment {appointment.Id} booked successfully for Patient {appointment.PatientId} with Doctor {appointment.DoctorId}. Price: {appointment.Price}");
+
+                // Create a new Bill
+                var newBill = new Bill
+                {
+                    AppointmentId = appointment.Id, // Link to the newly created appointment
+                    PatientId = appointment.PatientId,
+                    DoctorId = appointment.DoctorId,
+                    BillDate = DateTime.Today,
+                    Status = "Pending", // Initial status for a new bill
+                    TotalAmount = appointment.Price, // Initial total amount from appointment price
+                    Notes = $"Bill for Appointment #{appointment.Id} - {appointment.Reason}"
+                };
+
+                // Create a BillItem for the appointment fee
+                var appointmentFeeItem = new BillItem
+                {
+                    ItemName = "Appointment Fee", // Or "Consultation Fee"
+                    Quantity = 1,
+                    UnitPrice = appointment.Price,
+                    Amount = appointment.Price,
+                    Bill = newBill // Link the bill item to the new bill
+                };
+
+                newBill.BillItems = new List<BillItem> { appointmentFeeItem }; // Add the item to the bill's collection
+
+                _context.Bills.Add(newBill);
+                await _context.SaveChangesAsync(); // Save the bill and its item
+
+                Debug.WriteLine($"Bill {newBill.BillId} created for Appointment {appointment.Id} with Total Amount: {newBill.TotalAmount}");
+                // --- End: Automatic Bill Creation Logic ---
+
+
+                TempData["SuccessMessage"] = "Appointment booked and bill generated successfully!";
+
+                if (IsPatient())
+                {
+                    return RedirectToAction("Appointments", "Appointment");
+                }
+                else if (IsDoctor())
+                {
+                    return RedirectToAction("Schedule", "Doctor"); // Assuming a Doctor/Schedule action
+                }
+                else
+                {
+                    return RedirectToAction("AllAppointments", "Appointment");
+                }
+            }
+
+            // If ModelState is not valid, re-populate ViewBags and return to view
+            ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+            ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+            ViewData["Title"] = "Book New Appointment";
+            return View(appointment);
+        }
+
+        // GET: Appointment/Edit/5
+        [HttpGet]
+        public async Task<IActionResult> Edit(int? id)
+        {
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to edit appointments.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            // *** IMPORTANT: Restrict patients from accessing Edit directly ***
+            if (IsPatient())
+            {
+                TempData["ErrorMessage"] = "Patients are not authorized to edit appointments. You can only view details.";
+                return RedirectToAction("Appointments", "Appointment"); // Redirect patient to their appointment list
+            }
+
+            // Always populate ViewBags for dropdowns regardless of authorization paths
+            ViewBag.Patients = await _context.Patients
+                                             .OrderBy(p => p.Name)
+                                             .Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" })
+                                             .ToListAsync();
+            ViewBag.Doctors = await _context.Doctors
+                                            .OrderBy(d => d.Name)
+                                            .Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" })
+                                            .ToListAsync();
+
+            if (id == null) return NotFound();
+
+            var appointment = await _context.Appointments
+                                            .Include(a => a.Patient)
+                                            .Include(a => a.Doctor)
+                                            .FirstOrDefaultAsync(a => a.Id == id);
+
+            if (appointment == null)
+            {
+                TempData["ErrorMessage"] = $"Appointment with ID {id} not found.";
+                return NotFound();
+            }
+
+            // Allow Admin or Doctor (if it's their appointment) to edit
+            if (IsAdmin() || (IsDoctor() && GetDoctorIdFromSession() == appointment.DoctorId))
+            {
+                ViewData["Title"] = "Edit Appointment";
+                return View(appointment);
+            }
+            else
+            {
+                TempData["ErrorMessage"] = "You are not authorized to edit this appointment.";
+                if (IsDoctor()) return RedirectToAction("Schedule", "Doctor"); // Assuming a Doctor/Schedule action
+                return RedirectToAction("Login", "Account"); // Fallback for other unauthorized roles
+            }
+        }
+
+        // POST: Appointment/Edit/5
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> Edit(int id, [Bind("Id,PatientId,DoctorId,AppointmentDateTime,Reason,Location,Status,Price")] Appointment appointment)
+        {
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to edit appointments.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            // *** IMPORTANT: Restrict patients from accessing Edit directly for POST ***
+            if (IsPatient())
+            {
+                TempData["ErrorMessage"] = "Patients are not authorized to edit appointments. You can only view details.";
+                return RedirectToAction("Appointments", "Appointment");
+            }
+
+            if (id != appointment.Id) return NotFound();
+
+            var existingAppointment = await _context.Appointments
+                                                    .AsNoTracking() // Use AsNoTracking for fetching before update
+                                                    .Include(a => a.Patient)
+                                                    .Include(a => a.Doctor)
+                                                    .FirstOrDefaultAsync(a => a.Id == id);
+
+            if (existingAppointment == null)
+            {
+                TempData["ErrorMessage"] = "The appointment you are trying to edit was not found or has been deleted.";
+                return NotFound();
+            }
+
+            // Authorization: Admin, or Doctor (if it's their appointment)
+            if (!(IsAdmin() || (IsDoctor() && GetDoctorIdFromSession() == existingAppointment.DoctorId)))
+            {
+                TempData["ErrorMessage"] = "You are not authorized to edit this appointment.";
+                if (IsDoctor()) return RedirectToAction("Schedule", "Doctor");
+                return RedirectToAction("Login", "Account");
+            }
+
+            // Manually add price validation
+            if (appointment.Price < 0)
+            {
+                ModelState.AddModelError("Price", "Price cannot be negative.");
+            }
+
+            if (!ModelState.IsValid)
+            {
+                // Re-populate ViewBags on ModelState invalid for POST
+                ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                ViewData["Title"] = "Edit Appointment";
+                return View(appointment);
+            }
+
+            if (appointment.AppointmentDateTime < DateTime.Now && appointment.Status != "Completed" && appointment.Status != "Cancelled")
+            {
+                ModelState.AddModelError("AppointmentDateTime", "Appointment date and time cannot be in the past for scheduled appointments.");
+                // Re-populate ViewBags on ModelState invalid for POST
+                ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                ViewData["Title"] = "Edit Appointment";
+                return View(appointment);
+            }
+
+            try
+            {
+                bool isDoctorBusy = await _context.Appointments.AnyAsync(a =>
+                    a.DoctorId == appointment.DoctorId &&
+                    a.AppointmentDateTime == appointment.AppointmentDateTime &&
+                    a.Id != appointment.Id && // Exclude the current appointment being edited
+                    a.Status != "Cancelled" && a.Status != "Completed");
+
+                if (isDoctorBusy)
+                {
+                    TempData["ErrorMessage"] = "The selected doctor is not available at this exact time. Please choose another time.";
+                    // Re-populate ViewBags on error for POST
+                    ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                    ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                    ViewData["Title"] = "Edit Appointment";
+                    return View(appointment);
+                }
+
+                _context.Update(appointment);
+                await _context.SaveChangesAsync();
+                TempData["SuccessMessage"] = "Appointment updated successfully!";
+            }
+            catch (DbUpdateConcurrencyException)
+            {
+                if (!AppointmentExists(appointment.Id))
+                {
+                    TempData["ErrorMessage"] = "The appointment was deleted by another user. Cannot save changes.";
+                    return NotFound();
+                }
+                else
+                {
+                    throw; // Re-throw if a real concurrency issue
+                }
+            }
+            catch (Exception ex)
+            {
+                TempData["ErrorMessage"] = $"An error occurred while updating the appointment: {ex.Message}";
+                Debug.WriteLine($"Error updating appointment: {ex.Message}");
+                // Re-populate ViewBags on error for POST
+                ViewBag.Patients = await _context.Patients.OrderBy(p => p.Name).Select(p => new { Value = p.PatientId, Text = p.Name ?? "Unnamed Patient" }).ToListAsync();
+                ViewBag.Doctors = await _context.Doctors.OrderBy(d => d.Name).Select(d => new { Value = d.Id, Text = d.Name ?? "Unnamed Doctor" }).ToListAsync();
+                ViewData["Title"] = "Edit Appointment";
+                return View(appointment);
+            }
+
+            if (IsPatient())
+            {
+                return RedirectToAction("Appointments", "Appointment");
+            }
+            else if (IsDoctor())
+            {
+                return RedirectToAction("Schedule", "Doctor");
+            }
+            else // IsAdmin()
+            {
+                return RedirectToAction("AllAppointments", "Appointment");
+            }
+        }
+
+        // GET: Appointment/Details/5
+        [HttpGet]
+        public async Task<IActionResult> Details(int? id)
+        {
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to view appointment details.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            if (id == null) return NotFound();
+
+            var appointment = await _context.Appointments
+                .Include(a => a.Patient)
+                .Include(a => a.Doctor)
+                .FirstOrDefaultAsync(m => m.Id == id);
+            if (appointment == null) return NotFound();
+
+            // Authorization: Admin, or Patient (for their own), or Doctor (for their own)
+            if (!(IsAdmin() || (IsPatient() && GetPatientIdFromSession() == appointment.PatientId) || (IsDoctor() && GetDoctorIdFromSession() == appointment.DoctorId)))
+            {
+                TempData["ErrorMessage"] = "You are not authorized to view this appointment's details.";
+                if (IsPatient()) return RedirectToAction("Appointments", "Appointment");
+                if (IsDoctor()) return RedirectToAction("Schedule", "Doctor");
+                return RedirectToAction("Login", "Account");
+            }
+
+            ViewData["Title"] = "Appointment Details";
+            return View(appointment);
+        }
+
+        // GET: Appointment/Delete/5
+        [HttpGet]
+        public async Task<IActionResult> Delete(int? id)
+        {
+            if (!IsLoggedIn() || (!IsAdmin() && !IsDoctor())) // Only Admin/Doctor can access Delete (GET)
+            {
+                TempData["ErrorMessage"] = "You are not authorized to delete appointments.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            if (id == null) return NotFound();
+
+            var appointment = await _context.Appointments
+                                            .Include(a => a.Patient)
+                                            .Include(a => a.Doctor)
+                                            .FirstOrDefaultAsync(m => m.Id == id);
+            if (appointment == null) return NotFound();
+
+            // Doctor can only delete their own appointments
+            if (IsDoctor() && GetDoctorIdFromSession() != appointment.DoctorId)
+            {
+                TempData["ErrorMessage"] = "Doctors can only delete their own appointments.";
+                return RedirectToAction("Schedule", "Doctor");
+            }
+
+            ViewData["Title"] = "Delete Appointment";
+            return View(appointment);
+        }
+
+        // POST: Appointment/Delete/5
+        [HttpPost, ActionName("Delete")]
+        [ValidateAntiForgeryToken]
+        public async Task<IActionResult> DeleteConfirmed(int id)
+        {
+            if (!IsLoggedIn() || (!IsAdmin() && !IsDoctor())) // Only Admin/Doctor can perform Delete (POST)
+            {
+                return Json(new { success = false, message = "Unauthorized to delete appointments." });
+            }
+
+            try
+            {
+                var appointment = await _context.Appointments
+                                                .Include(a => a.Bills) // Include bills to handle cascading deletion
+                                                .FirstOrDefaultAsync(a => a.Id == id);
+                if (appointment == null)
+                {
+                    return Json(new { success = false, message = "Appointment not found." });
+                }
+
+                // Doctor can only delete their own appointments
+                if (IsDoctor() && GetDoctorIdFromSession() != appointment.DoctorId)
+                {
+                    return Json(new { success = false, message = "Doctors can only delete their own appointments." });
+                }
+
+                // Before deleting the appointment, ensure associated bills are handled.
+                // Option 1: Delete associated bills and their items (Cascade Delete)
+                if (appointment.Bills != null && appointment.Bills.Any())
+                {
+                    foreach (var bill in appointment.Bills.ToList()) // ToList() to avoid modification during enumeration
+                    {
+                        if (bill.BillItems != null && bill.BillItems.Any())
+                        {
+                            _context.BillItems.RemoveRange(bill.BillItems);
+                        }
+                        _context.Bills.Remove(bill);
+                    }
+                }
+                // Option 2: Set AppointmentId in associated bills to null (if AppointmentId in Bill model is nullable)
+                // var associatedBills = await _context.Bills.Where(b => b.AppointmentId == id).ToListAsync();
+                // foreach (var bill in associatedBills)
+                // {
+                //      bill.AppointmentId = null; // Requires AppointmentId to be nullable in Bill model
+                //      _context.Entry(bill).State = EntityState.Modified;
+                // }
+
+
+                _context.Appointments.Remove(appointment);
+                await _context.SaveChangesAsync();
+                TempData["SuccessMessage"] = "Appointment deleted successfully!";
+                return Json(new { success = true, message = "Appointment deleted successfully!" });
+            }
+            catch (DbUpdateException dbEx)
+            {
+                Debug.WriteLine($"DbUpdateException while deleting appointment {id}: {dbEx.Message}");
+                if (dbEx.InnerException != null)
+                {
+                    Debug.WriteLine($"Inner Exception (DbUpdateException): {dbEx.InnerException.Message}");
+                }
+                return Json(new { success = false, message = $"Database error: The appointment could not be deleted due to related records. Please ensure any associated bills are deleted first." });
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error deleting appointment: {ex.Message}");
+                if (ex.InnerException != null)
+                {
+                    Debug.WriteLine($"Inner Exception: {ex.InnerException.Message}");
+                }
+                return Json(new { success = false, message = $"Error deleting appointment: {ex.Message}" });
+            }
+        }
+
+        // GET: Appointment/CheckAvailability
+        // This action renders a view to check doctor availability (which is your Feature2.cshtml)
+        [HttpGet]
+        public async Task<IActionResult> CheckAvailability(int? selectedDoctorId, DateTime? selectedDate)
+        {
+            if (!IsLoggedIn())
+            {
+                TempData["ErrorMessage"] = "You must be logged in to check doctor availability.";
+                return RedirectToAction("Login", "Account");
+            }
+
+            var doctors = await _context.Doctors
+                                        .OrderBy(d => d.Name)
+                                        .Select(d => new Doctor { Id = d.Id, Name = d.Name ?? "Unnamed Doctor", Specialization = d.Specialization ?? "N/A" })
+                                        .ToListAsync();
+
+            var viewModel = new DoctorAvailabilityViewModel
+            {
+                AllDoctors = doctors,
+                SelectedDate = selectedDate ?? DateTime.Today,
+                SelectedDoctorId = selectedDoctorId
+            };
+
+            ViewData["Title"] = "Check Doctor Availability";
+
+            if (selectedDoctorId.HasValue && selectedDoctorId.Value > 0)
+            {
+                var doctor = await _context.Doctors.FindAsync(selectedDoctorId.Value);
+                if (doctor != null)
+                {
+                    viewModel.SelectedDoctorDetails = doctor;
+
+                    var doctorSchedule = await _context.DoctorSchedules
+                                                             .FirstOrDefaultAsync(ds => ds.DoctorId == selectedDoctorId.Value && ds.Date.Date == viewModel.SelectedDate.Date);
+
+                    if (doctorSchedule == null)
+                    {
+                        TempData["InfoMessage"] = $"No specific work schedule defined for Dr. {doctor.Name} on {viewModel.SelectedDate.ToShortDateString()}. Using default availability (9 AM - 5 PM, 12-1 PM lunch).";
+                        doctorSchedule = new DoctorSchedule
+                        {
+                            StartTime = new TimeSpan(9, 0, 0),
+                            EndTime = new TimeSpan(17, 0, 0),
+                            LunchStartTime = new TimeSpan(12, 0, 0),
+                            LunchEndTime = new TimeSpan(13, 0, 0),
+                            DoctorId = selectedDoctorId.Value,
+                            Date = viewModel.SelectedDate.Date,
+                            Location = "General Clinic"
+                        };
+                    }
+
+                    viewModel.DoctorSchedule = doctorSchedule; // Assign the resolved doctorSchedule to the ViewModel
+
+                    var bookedAppointments = await _context.Appointments
+                                                            .Where(a => a.DoctorId == selectedDoctorId.Value
+                                                                   && a.AppointmentDateTime.Date == viewModel.SelectedDate.Date
+                                                                   && a.Status != "Cancelled"
+                                                                   && a.Status != "Completed")
+                                                            .Select(a => a.AppointmentDateTime.TimeOfDay)
+                                                            .ToListAsync();
+
+                    TimeSpan slotDuration = TimeSpan.FromMinutes(30);
+
+                    // Generate available time slots based on the doctor's schedule
+                    List<TimeSpan> availableSlots = new List<TimeSpan>();
+                    for (TimeSpan time = doctorSchedule.StartTime; time < doctorSchedule.EndTime; time = time.Add(slotDuration))
+                    {
+                        // Skip lunch break
+                        if (time >= doctorSchedule.LunchStartTime && time < doctorSchedule.LunchEndTime)
+                        {
+                            continue;
+                        }
+
+                        // Check if the slot is already booked
+                        if (!bookedAppointments.Contains(time))
+                        {
+                            // Ensure the slot is not in the past
+                            DateTime currentSlotDateTime = viewModel.SelectedDate.Date.Add(time);
+                            if (currentSlotDateTime > DateTime.Now)
+                            {
+                                availableSlots.Add(time);
+                            }
+                        }
+                    }
+                    viewModel.AvailableSlots = availableSlots;
+                }
+                else
+                {
+                    TempData["ErrorMessage"] = "Selected doctor not found.";
+                }
+            }
+
+            // Explicitly return the "Feature2" view with the populated viewModel
+            return View("Feature2", viewModel);
+        }
+
+        // NEW ACTION: GetAvailableSlots - for AJAX calls from Book Appointment page
+        [HttpGet]
+        public async Task<IActionResult> GetAvailableSlots(int doctorId, DateTime selectedDate)
+        {
+            if (!IsLoggedIn())
+            {
+                return Json(new { success = false, message = "Not authenticated." });
+            }
+
+            var doctor = await _context.Doctors.FindAsync(doctorId);
+            if (doctor == null)
+            {
+                return Json(new { success = false, message = "Doctor not found." });
+            }
+
+            var doctorSchedule = await _context.DoctorSchedules
+                                                     .FirstOrDefaultAsync(ds => ds.DoctorId == doctorId && ds.Date.Date == selectedDate.Date);
+
+            // Use default schedule if a specific one isn't found for the date
+            if (doctorSchedule == null)
+            {
+                doctorSchedule = new DoctorSchedule
+                {
+                    StartTime = new TimeSpan(9, 0, 0),
+                    EndTime = new TimeSpan(17, 0, 0),
+                    LunchStartTime = new TimeSpan(12, 0, 0),
+                    LunchEndTime = new TimeSpan(13, 0, 0),
+                    DoctorId = doctorId,
+                    Date = selectedDate.Date,
+                    Location = "General Clinic"
+                };
+            }
+
+            var bookedAppointments = await _context.Appointments
+                                                     .Where(a => a.DoctorId == doctorId
+                                                                && a.AppointmentDateTime.Date == selectedDate.Date
+                                                                && a.Status != "Cancelled"
+                                                                && a.Status != "Completed")
+                                                     .Select(a => a.AppointmentDateTime.TimeOfDay)
+                                                     .ToListAsync();
+
+            TimeSpan slotDuration = TimeSpan.FromMinutes(30);
+            List<string> availableSlots = new List<string>();
+
+            // Add a default option for the dropdown
+            availableSlots.Add("-- Select Time Slot --");
+
+            for (TimeSpan time = doctorSchedule.StartTime; time < doctorSchedule.EndTime; time = time.Add(slotDuration))
+            {
+                // Skip lunch break
+                if (time >= doctorSchedule.LunchStartTime && time < doctorSchedule.LunchEndTime)
+                {
+                    continue;
+                }
+
+                // Check if the slot is already booked and is not in the past
+                DateTime currentSlotDateTime = selectedDate.Date.Add(time);
+                if (!bookedAppointments.Contains(time) && currentSlotDateTime > DateTime.Now)
+                {
+                    availableSlots.Add(currentSlotDateTime.ToString(@"hh\:mm tt", CultureInfo.InvariantCulture));
+                }
+            }
+
+            if (!availableSlots.Any(s => s != "-- Select Time Slot --"))
+            {
+                // If only the default option exists, means no real slots are available
+                return Json(new { success = true, message = "No slots available for this date and doctor.", slots = new List<string> { "No slots available" } });
+            }
+
+            return Json(new { success = true, message = "Slots loaded successfully.", slots = availableSlots });
+        }
+
+
+        private bool AppointmentExists(int id)
+        {
+            return _context.Appointments.Any(e => e.Id == id);
+        }
+
+        // NEW ACTION: Mark Appointment as Completed
+        [HttpPost]
+        [ValidateAntiForgeryToken] // Important for security with AJAX POST requests
+        public async Task<IActionResult> MarkAsCompleted(int id)
+        {
+            // 1. Authorization Check: Only logged-in doctors should be able to mark appointments complete
+            if (!IsLoggedIn() || !IsDoctor())
+            {
+                // Return a Forbidden status if unauthorized
+                return Json(new { success = false, message = "You are not authorized to perform this action." });
+            }
+
+            // 2. Retrieve Appointment from DB
+            var appointment = await _context.Appointments.FindAsync(id);
+
+            if (appointment == null)
+            {
+                return Json(new { success = false, message = "Appointment not found." });
+            }
+
+            // 3. Verify Doctor's Ownership/Association: Ensure the doctor marking it complete is the assigned doctor
+            int? doctorIdFromSession = GetDoctorIdFromSession();
+            if (!doctorIdFromSession.HasValue || appointment.DoctorId != doctorIdFromSession.Value)
+            {
+                // Log unauthorized access attempt if needed
+                return Json(new { success = false, message = "You can only mark your own appointments as completed." });
+            }
+
+            // 4. Update Status (and potentially other relevant fields like ActualCompletionTime)
+            if (appointment.Status == "Scheduled") // Only mark 'Scheduled' appointments as completed
+            {
+                appointment.Status = "Completed";
+                // Optionally, add a completion timestamp
+                // appointment.ActualCompletionTime = DateTime.Now; 
+                _context.Update(appointment);
+
+                try
+                {
+                    await _context.SaveChangesAsync();
+                    return Json(new { success = true, message = "Appointment marked as completed successfully!" });
+                }
+                catch (DbUpdateConcurrencyException)
+                {
+                    // Handle concurrency conflicts if multiple users try to update the same appointment
+                    return Json(new { success = false, message = "Concurrency error: The appointment was modified or deleted by another user. Please refresh and try again." });
+                }
+                catch (Exception ex)
+                {
+                    // Log the full exception for debugging
+                    Console.WriteLine($"Error marking appointment {id} as completed: {ex.Message}");
+                    return Json(new { success = false, message = "An error occurred while saving changes." });
+                }
+            }
+            else
+            {
+                return Json(new { success = false, message = $"Appointment status is already '{appointment.Status}'. Cannot mark as completed." });
+            }
+        }
+    }
+}
+
+
+
+
+@model HospitalManagementSystem.Models.Appointment
+@inject IHttpContextAccessor HttpContextAccessor
+@using System.Globalization
+@using System.Text.Json // Needed for JsonSerializer
+
+@{
+    ViewData["Title"] = "Edit Appointment";
+
+    // Get the user's role from session
+    var role = HttpContextAccessor.HttpContext?.Session.GetString("Role");
+
+    // Dynamically set the layout based on the user's role
+    Layout = "~/Views/Shared/_Layout.cshtml"; // Ensure this uses the main layout
+
+    // Safely prepare the initial appointment date-time for JavaScript embedding
+    string initialAppointmentDateTimeForJs = "null"; // Default to JS 'null' literal string
+    if (Model?.AppointmentDateTime != null)
+    {
+        // Convert to ISO 8601 string ("o" format), then serialize it to a JSON string literal.
+        // JsonSerializer.Serialize handles all necessary escaping and adds quotes,
+        // making it safe to embed directly into JavaScript.
+        initialAppointmentDateTimeForJs = System.Text.Json.JsonSerializer.Serialize(Model.AppointmentDateTime.ToString("o"));
+    }
+}
+
+<h2 class="mb-4 text-center">✏️ Edit Appointment</h2>
+
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card shadow-sm p-4">
+            <div class="card-body">
+                <form asp-action="Edit">
+                    @Html.AntiForgeryToken()
+                    <div asp-validation-summary="ModelOnly" class="text-danger mb-3"></div>
+                    <input type="hidden" asp-for="Id" />
+
+                    @* Patient Information - Display only for Doctor/Admin, pre-filled value for Patient. Cannot be changed. *@
+                    <div class="form-group mb-3">
+                        <label asp-for="PatientId" class="control-label">Patient</label>
+                        <input asp-for="Patient.Name" class="form-control rounded-pill" disabled />
+                        <input type="hidden" asp-for="PatientId" /> @* Keep hidden input to send back PatientId *@
+                    </div>
+
+                    <div class="form-group mb-3">
+                        <label asp-for="DoctorId" class="control-label">Doctor</label>
+                        <select id="doctorSelect" asp-for="DoctorId" class="form-control rounded-pill" asp-items="@(new SelectList(ViewBag.Doctors, "Value", "Text", Model.DoctorId))">
+                            <option value="">-- Select Doctor --</option>
+                        </select>
+                        <span asp-validation-for="DoctorId" class="text-danger"></span>
+                    </div>
+
+                    <div class="form-group mb-3">
+                        <label for="appointmentDate" class="control-label">Appointment Date</label>
+                        <input type="date" id="appointmentDate" name="AppointmentDateTime_Date" class="form-control rounded-pill"
+                               value="@(Model?.AppointmentDateTime.ToString("yyyy-MM-dd"))" />
+                        <span asp-validation-for="AppointmentDateTime" class="text-danger"></span>
+                    </div>
+
+                    <div class="form-group mb-3">
+                        <label for="availableSlots" class="control-label">Available Time Slots</label>
+                        <select id="availableSlots" name="AppointmentDateTime_Time" class="form-control rounded-pill" disabled>
+                            <option value="">-- Select Date and Doctor --</option>
+                            @* The JavaScript will populate and select the correct time slot here *@
+                        </select>
+                        <span id="slotLoadingMessage" class="text-info d-none"><i class="fas fa-spinner fa-spin me-2"></i>Loading slots...</span>
+                        <span class="text-danger" id="slotErrorMessage"></span>
+                    </div>
+
+                    @* Hidden field to combine date and time for model binding *@
+                    <input type="hidden" asp-for="AppointmentDateTime" id="finalAppointmentDateTime" />
+
+                    <div class="form-group mb-3">
+                        <label asp-for="Reason" class="control-label">Reason for Appointment</label>
+                        <textarea asp-for="Reason" class="form-control rounded-pill" rows="3"></textarea>
+                        <span asp-validation-for="Reason" class="text-danger"></span>
+                    </div>
+
+                    <div class="form-group mb-3">
+                        <label asp-for="Status" class="control-label">Status</label>
+                        <select asp-for="Status" class="form-control rounded-pill">
+                            <option value="Scheduled">Scheduled</option>
+                            <option value="Completed">Completed</option>
+                            <option value="Cancelled">Cancelled</option>
+                        </select>
+                        <span asp-validation-for="Status" class="text-danger"></span>
+                    </div>
+
+                    @* Price input for the appointment (assuming Admin/Doctor can edit it) *@
+                    @if (Context.Session != null && (Context.Session.GetString("Role") == "Admin" || Context.Session.GetString("Role") == "Doctor"))
+                    {
+                        <div class="form-group mb-3">
+                            <label asp-for="Price" class="control-label">Appointment Price</label>
+                            <input asp-for="Price" type="number" step="0.01" min="0.00" class="form-control rounded-pill" />
+                            <span asp-validation-for="Price" class="text-danger"></span>
+                        </div>
+                    }
+                    else
+                    {
+                        <input type="hidden" asp-for="Price" /> @* Keep hidden if patient cannot edit *@
+                        @if (Model?.Price > 0)
+                        {
+                            <p class="mb-3 text-muted">Estimated Appointment Price: <strong class="text-success">₹@Model.Price.ToString("F2")</strong></p>
+                        }
+                    }
+
+                    <div class="form-group d-grid mt-4">
+                        <button type="submit" class="btn btn-primary btn-lg rounded-pill shadow-sm"><i class="fas fa-save me-2"></i> Save Changes</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="text-center mt-3">
+    @if (Context.Session != null && Context.Session.GetString("Role") == "Patient")
+    {
+        <a asp-action="Appointments" asp-controller="Appointment" class="btn btn-outline-secondary rounded-pill"><i class="fas fa-arrow-left me-2"></i> Back to My Appointments</a>
+    }
+    else
+    {
+        <a asp-action="AllAppointments" asp-controller="Appointment" class="btn btn-outline-secondary rounded-pill"><i class="fas fa-arrow-left me-2"></i> Back to All Appointments</a>
+    }
+</div>
+
+<!-- Custom Confirmation Modal (replacing window.alert/confirm) -->
+<div class="modal fade" id="customAlertModal" tabindex="-1" aria-labelledby="customAlertModalLabel" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="customAlertModalLabel">Message</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="customAlertModalBody">
+                <!-- Message will be inserted here -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal">OK</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+
+@section Scripts {
+    @{
+        await Html.RenderPartialAsync("_ValidationScriptsPartial");
+    }
+    <!-- Font Awesome for icons -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/js/all.min.js" crossorigin="anonymous"></script>
+
+    <script>
+        $(document).ready(function () {
+            const doctorSelect = $('#doctorSelect');
+            const appointmentDateInput = $('#appointmentDate');
+            const availableSlotsSelect = $('#availableSlots');
+            const slotLoadingMessage = $('#slotLoadingMessage');
+            const slotErrorMessage = $('#slotErrorMessage');
+            const finalAppointmentDateTime = $('#finalAppointmentDateTime');
+
+            // Safely get the initial ISO date string. JSON.parse will convert 'null' string to JS null.
+            const initialAppointmentDateTimeISO = JSON.parse('@Html.Raw(initialAppointmentDateTimeForJs)');
+            let initialFormattedTime = ''; // This will store the "hh:mm tt" part for matching
+
+            // Helper function to format a Date object to "hh:mm tt"
+            function formatTimeForDisplay(date) {
+                let hours = date.getHours();
+                let minutes = date.getMinutes();
+                const ampm = hours >= 12 ? 'PM' : 'AM';
+                hours = hours % 12;
+                hours = hours ? hours : 12; // the hour '0' should be '12'
+                minutes = minutes < 10 ? '0' + minutes : minutes;
+                return hours + ':' + minutes + ' ' + ampm;
+            }
+
+            // Only attempt to format if initialAppointmentDateTimeISO is not null
+            if (initialAppointmentDateTimeISO !== null) {
+                const dateObj = new Date(initialAppointmentDateTimeISO);
+                if (!isNaN(dateObj.getTime())) { // Check if date parsing was successful
+                    initialFormattedTime = formatTimeForDisplay(dateObj);
+                }
+            }
+
+            // Function to display custom Bootstrap alert modal
+            function showCustomAlert(title, message) {
+                $('#customAlertModalLabel').text(title);
+                $('#customAlertModalBody').html(message);
+                var modal = new bootstrap.Modal(document.getElementById('customAlertModal'));
+                modal.show();
+            }
+
+            // Function to load available slots via AJAX
+            async function loadAvailableSlots() {
+                const doctorId = doctorSelect.val();
+                const selectedDate = appointmentDateInput.val(); // YYYY-MM-DD format
+
+                // If no doctor or date is selected, simply reset and exit
+                if (!doctorId || doctorId === "" || !selectedDate || selectedDate === "") {
+                    availableSlotsSelect.empty().append('<option value="">-- Select Doctor and Date --</option>').prop('disabled', true);
+                    slotLoadingMessage.addClass('d-none');
+                    slotErrorMessage.text('').addClass('d-none');
+                    return;
+                }
+
+                availableSlotsSelect.empty().append('<option value="">-- Loading Slots --</option>').prop('disabled', true);
+                slotErrorMessage.text('').addClass('d-none');
+                slotLoadingMessage.removeClass('d-none');
+
+                try {
+                    const response = await $.ajax({
+                        url: '@Url.Action("GetAvailableSlots", "Appointment")',
+                        type: 'GET',
+                        data: {
+                            doctorId: doctorId,
+                            selectedDate: selectedDate
+                        }
+                    });
+
+                    slotLoadingMessage.addClass('d-none');
+
+                    if (response.success && response.slots && response.slots.length > 0) {
+                        availableSlotsSelect.empty();
+
+                        let hasRealSlots = false;
+                        if (!(response.slots.length === 1 && response.slots[0] === "No slots available")) {
+                             availableSlotsSelect.append('<option value="">-- Select Time Slot --</option>');
+                             hasRealSlots = true;
+                        }
+
+                        $.each(response.slots, function (index, slot) {
+                            const trimmedSlot = slot.trim();
+                            availableSlotsSelect.append($('<option></option>').val(trimmedSlot).text(trimmedSlot));
+                        });
+
+                        availableSlotsSelect.prop('disabled', false);
+
+                        // Attempt to pre-select the initial time
+                        if (hasRealSlots && initialFormattedTime) {
+                            const optionToSelect = availableSlotsSelect.find('option[value="' + initialFormattedTime + '"]');
+                            if (optionToSelect.length > 0) {
+                                availableSlotsSelect.val(initialFormattedTime);
+                            } else {
+                                availableSlotsSelect.val("");
+                            }
+                        } else if (availableSlotsSelect.find('option[value=""]').length > 0) {
+                             availableSlotsSelect.val("");
+                        }
+
+
+                    } else if (response.success === false) {
+                        availableSlotsSelect.empty().append('<option value="">-- Error Loading Slots --</option>');
+                        availableSlotsSelect.prop('disabled', true);
+                        slotErrorMessage.text(response.message || "An error occurred on the server.").removeClass('d-none');
+                    } else {
+                        availableSlotsSelect.empty().append('<option value="">-- No Slots Available --</option>');
+                        availableSlotsSelect.prop('disabled', true);
+                        slotErrorMessage.text("No slots found for this date and doctor.").removeClass('d-none');
+                    }
+                } catch (xhr, status, error) {
+                    slotLoadingMessage.addClass('d-none');
+                    availableSlotsSelect.empty().append('<option value="">-- Error Loading Slots --</option>');
+                    availableSlotsSelect.prop('disabled', true);
+
+                    let errorMessage = 'Error loading slots. Please try again.';
+                    try {
+                        const errorResponse = JSON.parse(xhr.responseText);
+                        if (errorResponse && errorResponse.message) {
+                            errorMessage = errorResponse.message;
+                        } else if (xhr.status === 404) {
+                            errorMessage = "Doctor or slots endpoint not found. Verify URL or server status.";
+                        } else if (xhr.status === 400) {
+                            errorMessage = "Invalid request for slots. Check parameters.";
+                        }
+                    } catch (e) { /* non-JSON error response */ }
+                    slotErrorMessage.text(errorMessage).removeClass('d-none');
+                }
+            }
+
+            // Combine date and time before form submission
+            $('form').on('submit', function () {
+                const datePart = appointmentDateInput.val();
+                const timePart = availableSlotsSelect.val();
+
+                if (datePart && timePart && timePart !== "" && timePart !== "-- Select Time Slot --" && timePart !== "No slots available" && timePart !== "-- Error Loading Slots --") {
+                    finalAppointmentDateTime.val(`${datePart} ${timePart}`);
+                } else {
+                    finalAppointmentDateTime.val('');
+                    showCustomAlert('Selection Required', 'Please select an available time slot before saving.');
+                    return false;
+                }
+            });
+
+            // Attach event listeners
+            doctorSelect.on('change', loadAvailableSlots);
+            appointmentDateInput.on('change', loadAvailableSlots);
+
+            // Initial load of available slots when the page loads
+            const initialDoctorIdValue = doctorSelect.val();
+            const initialDateValue = appointmentDateInput.val();
+
+            if (initialDoctorIdValue && initialDateValue) {
+                loadAvailableSlots();
+            }
+        });
+    </script>
+    <style>
+        /* Add some styling for the select inputs to make them rounded, similar to other inputs */
+        .form-control.rounded-pill, .form-select.rounded-pill {
+            border-radius: 50rem !important;
+            padding-left: 1.25rem;
+            padding-right: 1.25rem;
+        }
+
+        /* Adjust placeholder font style if needed */
+        select.form-control:invalid {
+            color: #6c757d; /* grey out default option */
+        }
+    </style>
+}
